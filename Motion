@@ -1,0 +1,218 @@
+'*************************************************
+' AUTO runs on RS and at power up
+' Sets intial values
+'*************************************************
+'
+#AUTO;'                 Initalize Loader for motion
+MO;'                    Motor Off
+CE 0;'                  Main Encoder Type (Normal quadrature)
+MT 1;'                  Motor Type (Servo motor)
+BR -1;'                 Brush Axis Type (Configured for external drive)
+OE 1;'                  !!! Enable Off-On-Error !!! DO NOT REMOVE !!!
+CN ,,,,,1;'             Configure Digital Output 4 for Drive Enable
+OF 0;'                  Set DAC Offset to 0 Volts
+TL 9.999;'              +/- 10 Volt DAC Limit
+TK 0;'                  Peak Torque - Not Used - TL is Max Limit
+BW 1500;'               Loader Brake to set Delay msec
+ER 10000;'              Set Follow Error counts                  
+KP 1;'                  P
+KI 0;'                  I      
+KD 6;'                  D
+FV 35;'                 Feed Forward Velaocity
+AC 50000;'              Intial Acceleration counts/sec 
+DC 50000;'              Initial Deceleration coutns/sec
+WT 1000;'               Wait for a second
+XQ #plcscan,1;'         Start PLC Thread 1
+XQ #filter,3;'          Start Analog In Filter Thread 3
+TW 2000;'               Motion Complete Time-Out msec
+DA *[];'                Deallocate all arrays
+DM data[20];'           Create Array to send to Perl program
+CB 3;'                  Clear Error Output to Mill PLC
+jogIn=0;'               Varible Jogging In  
+jogRet=0;'              Varible Jogging Out   
+posTol = 8182 ;'        Tolerance Counts for Full In & Out
+fullIn=1024000;'        Loader Fully In Setpoint Counts
+fullOut=0;'             Loader Fully Out Setpoint Counts
+inBit = 0
+outBit = 0
+inPls=fullIn+posTol
+inMns=fullIn-posTol
+outPls=fullOut+ posTol
+outMns=fullOut-posTol
+maxVel= 140000
+velocity = 140000
+EN
+'
+'*************************************************
+' This Thread acts like a PLC loop scan
+' Scan time is set by the AT command in msec
+'*************************************************
+'
+#plcscan
+AT0;'                  
+#scan
+AT-25;'               
+'GENERAL STOP MOTION
+IF (@IN[4]=0);'Input 4
+  STX
+ENDIF
+'
+'JOG INSERT LOADER
+IF ((@IN[5]=0)&(_BGA=0))
+  jogIn=1               
+  AC 90000        
+  DC 90000
+  JG 40000
+  SH
+  BG
+ENDIF;
+'
+IF ((@IN[5]=1)&(jogIn=1))
+  STX
+  MC
+  MO
+  jogIn=0
+ENDIF;
+'JOG RETRACT LOADER
+IF ((@IN[6]=0)&(_BGA=0))        
+  jogRet=1               
+  AC 90000 
+  DC 90000
+  JG -40000
+  SH
+  BG
+ENDIF;
+IF ((@IN[6]=1)&(jogRet=1))
+  STX
+  MC
+  MO
+  jogRet=0
+ENDIF;
+'RE-DEFINE LOADER POSITION
+IF (@IN[3]=0);'
+  DP 0
+    IF (_XQ2 = -1)
+      XQ #motion,2;'Start Motion Thread if not running
+      SB 3;' Set Digital Output 3 No Error to Mill PLC
+    ENDIF;
+ENDIF;
+'
+' SET/CLEAR BIT FOR IN POSITION TO MILL PLC
+IF ((_TPA < inPls)&(_TPA > inMns))
+  inBit = 1;
+ELSE
+  inBit = 0;
+ENDIF
+IF ((_TPA < outPls)&(_TPA > outMns))
+  outBit = 1;
+ELSE
+  outBit = 0;
+ENDIF
+IF ((inBit=1)|((outBit=1)&(_BGA=0))
+  SB2;'  Output 2 to MIll PLC Fully In or Out
+ELSE
+  CB2
+ENDIF
+'
+' CLEAR OK STATUS BIT TO MILL PLC
+IF ((_XQ2 = -1)|((_XQ2 = -1))
+  CB 3
+ENDIF;
+' Data to PERL program 
+data[0] = _RPA
+data[1] = _SCA
+data[2] = _TC
+data[3] = _TEA
+data[4] = _TPA
+data[5] = _TTA
+data[6] = _TVA
+data[7] = _ZAA
+data[8] = @OUT[1]
+data[9] = _MOA
+data[10] = _XQ0;'Thread 0 Status
+data[11] = _XQ1;'Thread 1 Status
+data[12] = _XQ2;'Thread 2 Status
+data[13] = _XQ3;'Thread 3 Status
+data[14] = TIME;'Time for Heartbeat
+JP#scan
+'
+'*************************************************
+'MOTION Thread is started after re-define position
+'if the MOTION thread is not already running
+'*************************************************
+'
+#motion
+'INSERT LOADER INTO PRESS
+' Input 1 Insert Loader from Mill PLC
+IF (@IN[1]=0) 
+  AC 50000
+  DC 50000
+  PA fullIn
+  SP 4000
+  SH                
+  BG
+  AD 10000;'Nosepiece Contact Counts
+  SP velocity
+  MC
+  WT 500
+ENDI
+'RETRACT LOADER FROM PRESS
+' Input 2 Retract Loader from Mill PLC
+IF (@IN[2]=0);'Input 2
+  AC 50000
+  DC 50000
+  PA fullOut
+  SP velocity
+  SH
+  BG
+  MC
+  WT 500
+  ST
+  MO
+ENDIF;
+JP #motion
+'
+' ANALOG INPUT NOISE FILTER & SPEED REQUEST
+' This is to smooth out the velocity demand from MIll PLC
+'
+#filter
+an1=@AN[1];'set initial value
+k1=1/512;k2=511/512
+AT0;'set initial time reference
+#loop
+an1=(k1*@AN[1])+(k2*an1);AT-2,1
+velocity=maxVel * ((an1*.2616705)-.2458133);' Scale 4-20mA to 0-1.000
+JP#loop
+'
+'
+'
+'
+'
+#CMDERR
+MG "ALARM: Command Error"
+CB 3;' Clear OK status Bit to Mill PLC
+HX 2;' Halt Execution Thread 2 (Motion)
+ST;' Stop
+WT 2000;' Wait 2 seconds
+MO ;' Motor Off  
+RE
+'
+#MCTIME;'                Motion Complete Time-Out Subroutine
+MG "ALARM: Loader Failed To Complete Motion Command"
+CB 3;' Clear OK status Bit to Mill PLC
+HX 2;'Halt Execution Thread 2 (Motion)
+ST;' Stop
+WT 2000;' Wait 2 seconds
+MO ;' Motor Off
+RE
+'
+#POSERR
+MG "ALARM: Loader Position Error"
+CB 3;' Clear OK status Bit to Mill PLC
+HX;' Halt Execution Thread 1&2 (PLC & Motion)
+ST;' Stop
+WT 2000;' Wait 2 seconds
+MO;' Motor Off
+RE
+'
+'
